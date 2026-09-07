@@ -1,0 +1,947 @@
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import os
+import random
+import tempfile
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "matplotlib"))
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+from torch import nn
+from torch_geometric.data import Data
+from torch_geometric.loader import DataLoader
+
+import backend_generalization_depth_10 as shared
+from gnn_delta import CircuitGNN
+from graph_representation import BackendFeatureProvider, qasm_to_pyg_graph
+
+
+PROJECT_DIR = Path(__file__).resolve().parent
+
+DEFAULT_SOURCE_CHECKPOINT = (
+    PROJECT_DIR
+    / "models_depth_8_direct_vs_loss_comparison"
+    / "loss_state.pt"
+)
+DEFAULT_NEW_TARGET_PKL = (
+    PROJECT_DIR
+    / "data_generation_results_constrained_depth_8_new_target"
+    / "depth_8_new_target_without_shallow_cxcx_density_target.pkl"
+)
+DEFAULT_OUT_DIR = PROJECT_DIR / "target_transfer_depth_8_athens_new_target_density_target"
+
+DEFAULT_K_VALUES = [50, 100, 250, 500, 1000, 2000, 5000, 10000]
+DEFAULT_GLOBAL_FEATURE_VARIANT = "new_baseline"
+DEFAULT_BACKEND_NAME = "athens"
+DEFAULT_SEED = 34
+
+
+def set_all_seeds(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def parse_k_values(value: str) -> List[int]:
+    values = [int(part.strip()) for part in value.split(",") if part.strip()]
+    if not values:
+        raise argparse.ArgumentTypeError("At least one k value is required.")
+    return values
+
+
+def first_existing(meta: Dict[str, Any], keys: Iterable[str]) -> Any:
+    for key in keys:
+        value = meta.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def infer_qasm(meta: Dict[str, Any]) -> Optional[str]:
+    qasm = first_existing(
+        meta,
+        ["qasm_transpiled", "qasm", "qasm_str", "circuit_qasm", "transpiled_qasm"],
+    )
+
+    if isinstance(qasm, bytes):
+        qasm = qasm.decode("utf-8")
+
+    if isinstance(qasm, str) and qasm.strip():
+        return qasm
+
+    return None
+
+
+def group_id_from_meta(meta: Dict[str, Any], qasm: str, idx: int) -> str:
+    if meta.get("group_id") is not None:
+        return str(meta["group_id"])
+
+    if meta.get("group") is not None:
+        return str(meta["group"])
+
+    if "budget" in meta and "run_idx" in meta:
+        return f"budget={meta['budget']}|run={meta['run_idx']}"
+
+    if "circuit_idx" in meta:
+        return f"circuit_idx={meta['circuit_idx']}"
+
+    return f"idx={idx}"
+
+
+def load_new_target_items(pkl_path: Path, backend_name: str) -> List[Tuple[Dict[str, Any], float]]:
+    raw = shared.load_pkl_items(pkl_path, backend_name)
+    items: List[Tuple[Dict[str, Any], float]] = []
+
+    for idx, (meta, noisy) in enumerate(raw):
+        meta = dict(meta)
+        qasm = infer_qasm(meta)
+        if qasm is None:
+            continue
+
+        meta["qasm_transpiled"] = qasm
+        meta["backend"] = backend_name
+        meta["backend_name"] = backend_name
+        meta["group_id"] = group_id_from_meta(meta, qasm, idx)
+        items.append((meta, float(noisy)))
+
+    if not items:
+        raise RuntimeError(f"No usable samples found in {pkl_path}")
+
+    return items
+
+
+def split_items_by_group(
+    items: List[Tuple[Dict[str, Any], float]],
+    seed: int,
+    max_groups: Optional[int],
+) -> Tuple[List[Tuple[Dict[str, Any], float]], List[Tuple[Dict[str, Any], float]], List[Tuple[Dict[str, Any], float]]]:
+    group_ids = [str(meta["group_id"]) for meta, _ in items]
+    train_groups, val_groups, test_groups = shared.split_group_ids(group_ids, seed, max_groups)
+
+    train_items = [(meta, y) for meta, y in items if str(meta["group_id"]) in train_groups]
+    val_items = [(meta, y) for meta, y in items if str(meta["group_id"]) in val_groups]
+    test_items = [(meta, y) for meta, y in items if str(meta["group_id"]) in test_groups]
+
+    return train_items, val_items, test_items
+
+
+def build_graphs(
+    items: List[Tuple[Dict[str, Any], float]],
+    backend_name: str,
+    global_feature_variant: str,
+) -> List[Data]:
+    provider = BackendFeatureProvider(backend_name)
+    graphs: List[Data] = []
+
+    for idx, (meta, noisy) in enumerate(items):
+        qasm = meta.get("qasm_transpiled")
+        if not isinstance(qasm, str) or not qasm.strip():
+            continue
+
+        graph, _ = qasm_to_pyg_graph(
+            qasm,
+            global_feature_variant=global_feature_variant,
+            backend_feature_provider=provider,
+            noiseless_fidelity=meta.get("oracle_noiseless_fidelity", None),
+            node_angle_encoding=shared.NODE_ANGLE_ENCODING,
+        )
+
+        if graph is None:
+            continue
+
+        graph.y = torch.tensor([float(noisy)], dtype=torch.float)
+        graph.backend_name = backend_name
+        graph.group_id = str(meta["group_id"])
+
+        for key in ("budget", "run_idx", "seed", "target_seed", "target_depth"):
+            if key in meta:
+                try:
+                    setattr(graph, key, int(meta[key]))
+                except Exception:
+                    setattr(graph, key, str(meta[key]))
+
+        graphs.append(graph)
+
+        if (idx + 1) % 10000 == 0:
+            print(f"Built {idx + 1}/{len(items)} graphs")
+
+    return graphs
+
+
+def true_delta_from_batch(batch: Data) -> torch.Tensor:
+    f_noiseless = shared.get_noiseless_fidelity_from_batch(batch)
+    f_noisy = batch.y.view(-1)
+    return f_noiseless - f_noisy
+
+
+def evaluate_model(
+    model: CircuitGNN,
+    graphs: List[Data],
+    batch_size: int,
+    device: torch.device,
+) -> Tuple[Dict[str, float], torch.Tensor, torch.Tensor]:
+    loader = DataLoader(graphs, batch_size=batch_size, shuffle=False)
+    y, pred = shared.collect_delta_predictions(model, loader, device)
+    metrics = shared.compute_all_metrics(y, pred)
+    return metrics, y, pred
+
+
+def load_checkpoint_payload(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"Missing source checkpoint: {path}")
+
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        payload = torch.load(path, map_location="cpu")
+
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Unsupported checkpoint format: {type(payload)}")
+
+    return payload
+
+
+def model_kwargs_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if isinstance(payload.get("model_kwargs"), dict):
+        return dict(payload["model_kwargs"])
+
+    config = payload.get("config", {})
+    if isinstance(config, dict) and isinstance(config.get("model_kwargs"), dict):
+        return dict(config["model_kwargs"])
+
+    return dict(shared.MODEL_KWARGS)
+
+
+def make_model_from_sample(
+    sample_graph: Data,
+    model_kwargs: Dict[str, Any],
+    device: torch.device,
+) -> CircuitGNN:
+    kwargs = dict(model_kwargs)
+    kwargs["node_in_dim"] = int(sample_graph.x.size(-1))
+    kwargs["global_in_dim"] = int(sample_graph.global_features.numel())
+    return CircuitGNN(**kwargs).to(device)
+
+
+def load_source_model(
+    checkpoint_path: Path,
+    sample_graph: Data,
+    device: torch.device,
+) -> Tuple[CircuitGNN, Dict[str, Any]]:
+    payload = load_checkpoint_payload(checkpoint_path)
+    model_kwargs = model_kwargs_from_payload(payload)
+    state_dict = payload.get("model_state_dict", payload.get("state_dict"))
+
+    if state_dict is None and payload and all(torch.is_tensor(v) for v in payload.values()):
+        state_dict = payload
+
+    if state_dict is None:
+        raise KeyError("Checkpoint does not contain model_state_dict or state_dict.")
+
+    model = make_model_from_sample(sample_graph, model_kwargs, device)
+    model.load_state_dict(state_dict)
+    model.eval()
+    return model, model_kwargs
+
+
+def freeze_gnn_if_requested(model: CircuitGNN, freeze_gnn: bool) -> None:
+    if not freeze_gnn:
+        return
+
+    for name, param in model.named_parameters():
+        lower = name.lower()
+        param.requires_grad = "regressor" in lower or "global_mlp" in lower
+
+
+def train_or_finetune_model(
+    model: CircuitGNN,
+    train_graphs: List[Data],
+    val_graphs: List[Data],
+    device: torch.device,
+    *,
+    batch_size: int,
+    epochs: int,
+    lr: float,
+    patience: int,
+    min_delta: float,
+    out_dir: Optional[Path],
+    label: str,
+    source_checkpoint: Path,
+    new_target_pkl: Path,
+) -> Tuple[CircuitGNN, Dict[str, Any]]:
+    model.to(device)
+
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    if not trainable_params:
+        raise RuntimeError("No trainable parameters remain in the model.")
+
+    optimizer = torch.optim.Adam(trainable_params, lr=lr)
+    loss_fn = nn.HuberLoss()
+
+    train_loader = DataLoader(train_graphs, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_graphs, batch_size=batch_size, shuffle=False)
+
+    best_val = float("inf")
+    best_state = None
+    bad_epochs = 0
+    train_history: List[float] = []
+    val_history: List[float] = []
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        train_losses: List[float] = []
+
+        for batch in train_loader:
+            batch = batch.to(device)
+
+            pred_delta = model(batch).view(-1)
+            true_delta = true_delta_from_batch(batch)
+            mask = torch.isfinite(pred_delta) & torch.isfinite(true_delta)
+
+            if not mask.any():
+                continue
+
+            loss = loss_fn(pred_delta[mask], true_delta[mask])
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            optimizer.step()
+
+            train_losses.append(float(loss.detach().item()))
+
+        model.eval()
+        val_losses: List[float] = []
+
+        with torch.no_grad():
+            for batch in val_loader:
+                batch = batch.to(device)
+
+                pred_delta = model(batch).view(-1)
+                true_delta = true_delta_from_batch(batch)
+                mask = torch.isfinite(pred_delta) & torch.isfinite(true_delta)
+
+                if not mask.any():
+                    continue
+
+                loss = loss_fn(pred_delta[mask], true_delta[mask])
+                val_losses.append(float(loss.detach().item()))
+
+        train_loss = float(np.mean(train_losses)) if train_losses else float("nan")
+        val_loss = float(np.mean(val_losses)) if val_losses else float("nan")
+        train_history.append(train_loss)
+        val_history.append(val_loss)
+
+        if val_loss + min_delta < best_val:
+            best_val = val_loss
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            bad_epochs = 0
+        else:
+            bad_epochs += 1
+
+        if epoch == 1 or epoch % 10 == 0:
+            print(
+                f"[{label}] epoch={epoch:04d} | "
+                f"train_delta_huber={train_loss:.7f} | "
+                f"val_delta_huber={val_loss:.7f} | "
+                f"best={best_val:.7f} | bad={bad_epochs}"
+            )
+
+        if bad_epochs >= patience:
+            print(f"[{label}] early stopping at epoch {epoch}. best_val={best_val:.7f}")
+            break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    if out_dir is not None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(model.state_dict(), out_dir / "state_dict.pt")
+        torch.save(
+            {
+                "label": label,
+                "source_checkpoint": str(source_checkpoint),
+                "new_target_pkl": str(new_target_pkl),
+                "model_state_dict": model.state_dict(),
+                "best_val_huber": best_val,
+                "epochs_run": len(train_history),
+                "lr": lr,
+                "batch_size": batch_size,
+                "train_size": len(train_graphs),
+                "val_size": len(val_graphs),
+            },
+            out_dir / "checkpoint.pt",
+        )
+        save_loss_curves(train_history, val_history, out_dir / "loss_curves.png", label)
+
+    return model, {
+        "best_val_huber": best_val,
+        "epochs_run": len(train_history),
+        "train_loss_last": train_history[-1] if train_history else float("nan"),
+        "val_loss_last": val_history[-1] if val_history else float("nan"),
+    }
+
+
+def balanced_sample_graphs(graphs: List[Data], k: int, seed: int) -> List[Data]:
+    if k >= len(graphs):
+        out = list(graphs)
+        random.Random(seed).shuffle(out)
+        return out
+
+    rng = random.Random(seed)
+    by_budget: Dict[int, List[Data]] = {}
+
+    for graph in graphs:
+        budget = int(getattr(graph, "budget", -1))
+        by_budget.setdefault(budget, []).append(graph)
+
+    budgets = sorted(by_budget)
+    for budget in budgets:
+        rng.shuffle(by_budget[budget])
+
+    selected: List[Data] = []
+    base = k // max(1, len(budgets))
+    remainder = k % max(1, len(budgets))
+
+    for idx, budget in enumerate(budgets):
+        take = base + (1 if idx < remainder else 0)
+        selected.extend(by_budget[budget][:take])
+
+    if len(selected) < k:
+        selected_ids = {id(graph) for graph in selected}
+        remaining = [graph for graph in graphs if id(graph) not in selected_ids]
+        rng.shuffle(remaining)
+        selected.extend(remaining[: k - len(selected)])
+
+    rng.shuffle(selected)
+    return selected
+
+
+def save_loss_curves(
+    train_history: List[float],
+    val_history: List[float],
+    out_path: Path,
+    title: str,
+) -> None:
+    if not train_history or not val_history:
+        return
+
+    plt.figure(figsize=(7, 4.5))
+    plt.plot(train_history, label="Train")
+    plt.plot(val_history, label="Validation")
+    plt.xlabel("Epoch")
+    plt.ylabel("Huber loss")
+    plt.title(title)
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=250)
+    plt.close()
+
+
+def save_scatter(
+    y: torch.Tensor,
+    pred: torch.Tensor,
+    metrics: Dict[str, float],
+    out_path: Path,
+    title: str,
+) -> None:
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.scatter(y.tolist(), pred.tolist(), s=7, alpha=0.35, edgecolors="none")
+    ax.plot([0.0, 1.0], [0.0, 1.0], color="red", linestyle="--", linewidth=2)
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.0)
+    ax.set_xlabel("Simulated noisy fidelity")
+    ax.set_ylabel("Predicted noisy fidelity")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+
+    text = (
+        f"$R^2$ = {metrics['r2']:.3f}\n"
+        f"MAE = {metrics['mae']:.4g}\n"
+        f"Spearman = {metrics['spearman']:.3f}"
+    )
+    ax.text(
+        0.05,
+        0.95,
+        text,
+        transform=ax.transAxes,
+        va="top",
+        ha="left",
+        bbox=dict(boxstyle="round", facecolor="white", alpha=0.85),
+    )
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=250)
+    plt.close(fig)
+
+
+def write_csv(rows: List[Dict[str, Any]], path: Path) -> None:
+    if not rows:
+        return
+
+    fieldnames = sorted(set().union(*(row.keys() for row in rows)))
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def aggregate_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    grouped: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
+
+    for row in rows:
+        if row["approach"] == "zero_shot":
+            continue
+        grouped.setdefault((str(row["approach"]), int(row["k"])), []).append(row)
+
+    out: List[Dict[str, Any]] = []
+
+    for (approach, k), values in sorted(grouped.items(), key=lambda item: (item[0][0], item[0][1])):
+        mae = np.asarray([float(row["mae"]) for row in values], dtype=float)
+        rmse = np.asarray([float(row["rmse"]) for row in values], dtype=float)
+        r2 = np.asarray([float(row["r2"]) for row in values], dtype=float)
+        spearman = np.asarray([float(row["spearman"]) for row in values], dtype=float)
+
+        out.append(
+            {
+                "approach": approach,
+                "k": k,
+                "n_repeats": len(values),
+                "mae_mean": float(np.mean(mae)),
+                "mae_std": float(np.std(mae, ddof=1)) if len(mae) > 1 else 0.0,
+                "rmse_mean": float(np.mean(rmse)),
+                "rmse_std": float(np.std(rmse, ddof=1)) if len(rmse) > 1 else 0.0,
+                "r2_mean": float(np.mean(r2)),
+                "r2_std": float(np.std(r2, ddof=1)) if len(r2) > 1 else 0.0,
+                "spearman_mean": float(np.mean(spearman)),
+                "spearman_std": float(np.std(spearman, ddof=1)) if len(spearman) > 1 else 0.0,
+            }
+        )
+
+    return out
+
+
+def maybe_load_source_reference_mae(source_checkpoint: Path) -> Optional[float]:
+    metrics_path = source_checkpoint.parent / "metrics.json"
+
+    if not metrics_path.exists():
+        return None
+
+    try:
+        with metrics_path.open("r") as handle:
+            metrics = json.load(handle)
+
+        if isinstance(metrics.get("test_metrics"), dict):
+            value = float(metrics["test_metrics"].get("mae", float("nan")))
+        else:
+            value = float(metrics.get("mae", float("nan")))
+
+        return value if math.isfinite(value) else None
+    except Exception:
+        return None
+
+
+def save_learning_curve(
+    summary_rows: List[Dict[str, Any]],
+    zero_shot_mae: float,
+    source_reference_mae: Optional[float],
+    out_path: Path,
+) -> None:
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+
+    labels = {
+        "finetune_from_source": "Fine-tuned from source model",
+        "scratch_new_target": "Trained from scratch",
+    }
+
+    for approach, label in labels.items():
+        rows = sorted(
+            [row for row in summary_rows if row["approach"] == approach],
+            key=lambda row: int(row["k"]),
+        )
+        if not rows:
+            continue
+
+        x = np.asarray([int(row["k"]) for row in rows], dtype=float)
+        y = np.asarray([float(row["mae_mean"]) for row in rows], dtype=float)
+        yerr = np.asarray([float(row["mae_std"]) for row in rows], dtype=float)
+
+        ax.errorbar(x, y, yerr=yerr, marker="o", capsize=4, linewidth=2, label=label)
+
+    ax.axhline(
+        zero_shot_mae,
+        linestyle="--",
+        linewidth=2,
+        label=f"Zero-shot MAE = {zero_shot_mae:.4f}",
+    )
+
+    if source_reference_mae is not None and math.isfinite(source_reference_mae):
+        ax.axhline(
+            source_reference_mae,
+            linestyle=":",
+            linewidth=2,
+            label=f"Original target test MAE = {source_reference_mae:.4f}",
+        )
+
+    ax.set_xscale("log")
+    ax.set_xlabel("Number of new-target training samples")
+    ax.set_ylabel("Test MAE on new target")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+
+
+def save_predictions_csv(
+    y: torch.Tensor,
+    pred: torch.Tensor,
+    out_path: Path,
+) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with out_path.open("w", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["simulated_noisy_fidelity", "predicted_noisy_fidelity", "error", "abs_error"],
+        )
+        writer.writeheader()
+
+        for yy, pp in zip(y.tolist(), pred.tolist()):
+            writer.writerow(
+                {
+                    "simulated_noisy_fidelity": yy,
+                    "predicted_noisy_fidelity": pp,
+                    "error": pp - yy,
+                    "abs_error": abs(pp - yy),
+                }
+            )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Depth-8 new-target generalization and fine-tuning experiment."
+    )
+    parser.add_argument("--source-checkpoint", type=Path, default=DEFAULT_SOURCE_CHECKPOINT)
+    parser.add_argument("--new-target-pkl", type=Path, default=DEFAULT_NEW_TARGET_PKL)
+    parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
+    parser.add_argument("--backend-name", default=DEFAULT_BACKEND_NAME)
+    parser.add_argument("--global-feature-variant", default=DEFAULT_GLOBAL_FEATURE_VARIANT)
+    parser.add_argument("--k-values", type=parse_k_values, default=DEFAULT_K_VALUES)
+    parser.add_argument("--n-repeats", type=int, default=3)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--finetune-epochs", type=int, default=300)
+    parser.add_argument("--scratch-epochs", type=int, default=300)
+    parser.add_argument("--finetune-lr", type=float, default=1e-3)
+    parser.add_argument("--scratch-lr", type=float, default=1e-3)
+    parser.add_argument("--patience", type=int, default=12)
+    parser.add_argument("--min-delta", type=float, default=1e-6)
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument("--max-groups", type=int, default=None)
+    parser.add_argument("--freeze-gnn", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    set_all_seeds(args.seed)
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 80)
+    print("Depth-8 target generalization and fine-tuning")
+    print("=" * 80)
+    print(f"Source checkpoint:      {args.source_checkpoint}")
+    print(f"New target PKL:         {args.new_target_pkl}")
+    print(f"Output dir:             {args.out_dir}")
+    print(f"Backend:                {args.backend_name}")
+    print(f"Global feature variant: {args.global_feature_variant}")
+    print(f"K values:               {args.k_values}")
+    print(f"N repeats:              {args.n_repeats}")
+    print()
+
+    items = load_new_target_items(args.new_target_pkl, args.backend_name)
+    train_items, val_items, test_items = split_items_by_group(items, args.seed, args.max_groups)
+
+    print(
+        f"Split sample counts | train_pool={len(train_items)} | "
+        f"val={len(val_items)} | test={len(test_items)}"
+    )
+
+    print("Building train-pool graphs...")
+    train_graphs = build_graphs(train_items, args.backend_name, args.global_feature_variant)
+    print("Building validation graphs...")
+    val_graphs = build_graphs(val_items, args.backend_name, args.global_feature_variant)
+    print("Building test graphs...")
+    test_graphs = build_graphs(test_items, args.backend_name, args.global_feature_variant)
+
+    if not train_graphs or not val_graphs or not test_graphs:
+        raise RuntimeError("One split produced no graphs.")
+
+    print(
+        f"Graph counts | train_pool={len(train_graphs)} | "
+        f"val={len(val_graphs)} | test={len(test_graphs)} | "
+        f"node_dim={train_graphs[0].x.size(-1)} | "
+        f"global_dim={train_graphs[0].global_features.numel()}"
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    source_model, source_model_kwargs = load_source_model(args.source_checkpoint, train_graphs[0], device)
+    zero_metrics, zero_y, zero_pred = evaluate_model(source_model, test_graphs, args.batch_size, device)
+
+    print("\n" + "=" * 80)
+    print("ZERO-SHOT NEW-TARGET EVALUATION")
+    print("=" * 80)
+    print(
+        f"MAE={zero_metrics['mae']:.6f} | "
+        f"RMSE={zero_metrics['rmse']:.6f} | "
+        f"R2={zero_metrics['r2']:.4f} | "
+        f"Spearman={zero_metrics['spearman']:.4f}"
+    )
+
+    save_scatter(
+        zero_y,
+        zero_pred,
+        zero_metrics,
+        args.out_dir / "scatter_zero_shot_new_target.png",
+        "Zero-shot on new target",
+    )
+    save_predictions_csv(zero_y, zero_pred, args.out_dir / "predictions_zero_shot_new_target.csv")
+
+    result_rows: List[Dict[str, Any]] = [
+        {
+            "approach": "zero_shot",
+            "k": 0,
+            "repeat": 0,
+            "train_size": 0,
+            "val_size": len(val_graphs),
+            "test_size": len(test_graphs),
+            "best_val_huber": float("nan"),
+            "epochs_run": 0,
+            **zero_metrics,
+        }
+    ]
+
+    valid_k_values = [k for k in args.k_values if k <= len(train_graphs)]
+    if not valid_k_values:
+        raise RuntimeError(f"No k value fits in train pool of size {len(train_graphs)}.")
+
+    max_valid_k = max(valid_k_values)
+
+    for k in args.k_values:
+        if k > len(train_graphs):
+            print(f"Skipping k={k}: train pool has only {len(train_graphs)} graphs.")
+            continue
+
+        print("\n" + "=" * 80)
+        print(f"K = {k}")
+        print("=" * 80)
+
+        for rep in range(args.n_repeats):
+            subset_seed = args.seed + 1000 * k + rep
+            subset_graphs = balanced_sample_graphs(train_graphs, k, subset_seed)
+
+            set_all_seeds(args.seed + 10_000 + 1000 * k + rep)
+            finetune_model, _ = load_source_model(args.source_checkpoint, train_graphs[0], device)
+            freeze_gnn_if_requested(finetune_model, args.freeze_gnn)
+            finetune_model, finetune_info = train_or_finetune_model(
+                finetune_model,
+                subset_graphs,
+                val_graphs,
+                device,
+                batch_size=args.batch_size,
+                epochs=args.finetune_epochs,
+                lr=args.finetune_lr,
+                patience=args.patience,
+                min_delta=args.min_delta,
+                out_dir=args.out_dir / "models" / f"finetune_k{k}_rep{rep}",
+                label=f"finetune_k{k}_rep{rep}",
+                source_checkpoint=args.source_checkpoint,
+                new_target_pkl=args.new_target_pkl,
+            )
+
+            ft_metrics, ft_y, ft_pred = evaluate_model(finetune_model, test_graphs, args.batch_size, device)
+            result_rows.append(
+                {
+                    "approach": "finetune_from_source",
+                    "k": k,
+                    "repeat": rep,
+                    "train_size": len(subset_graphs),
+                    "val_size": len(val_graphs),
+                    "test_size": len(test_graphs),
+                    **finetune_info,
+                    **ft_metrics,
+                }
+            )
+            print(
+                f"[fine-tune] k={k} rep={rep} | "
+                f"MAE={ft_metrics['mae']:.6f} | "
+                f"RMSE={ft_metrics['rmse']:.6f} | "
+                f"R2={ft_metrics['r2']:.4f}"
+            )
+
+            if k == max_valid_k and rep == 0:
+                save_scatter(
+                    ft_y,
+                    ft_pred,
+                    ft_metrics,
+                    args.out_dir / "scatter_best_finetune_new_target.png",
+                    f"Fine-tuned on new target, k={k}",
+                )
+                save_predictions_csv(
+                    ft_y,
+                    ft_pred,
+                    args.out_dir / "predictions_best_finetune_new_target.csv",
+                )
+
+            set_all_seeds(args.seed + 20_000 + 1000 * k + rep)
+            scratch_model = make_model_from_sample(train_graphs[0], source_model_kwargs, device)
+            scratch_model, scratch_info = train_or_finetune_model(
+                scratch_model,
+                subset_graphs,
+                val_graphs,
+                device,
+                batch_size=args.batch_size,
+                epochs=args.scratch_epochs,
+                lr=args.scratch_lr,
+                patience=args.patience,
+                min_delta=args.min_delta,
+                out_dir=args.out_dir / "models" / f"scratch_k{k}_rep{rep}",
+                label=f"scratch_k{k}_rep{rep}",
+                source_checkpoint=args.source_checkpoint,
+                new_target_pkl=args.new_target_pkl,
+            )
+
+            scratch_metrics, scratch_y, scratch_pred = evaluate_model(
+                scratch_model,
+                test_graphs,
+                args.batch_size,
+                device,
+            )
+            result_rows.append(
+                {
+                    "approach": "scratch_new_target",
+                    "k": k,
+                    "repeat": rep,
+                    "train_size": len(subset_graphs),
+                    "val_size": len(val_graphs),
+                    "test_size": len(test_graphs),
+                    **scratch_info,
+                    **scratch_metrics,
+                }
+            )
+            print(
+                f"[scratch  ] k={k} rep={rep} | "
+                f"MAE={scratch_metrics['mae']:.6f} | "
+                f"RMSE={scratch_metrics['rmse']:.6f} | "
+                f"R2={scratch_metrics['r2']:.4f}"
+            )
+
+            if k == max_valid_k and rep == 0:
+                save_scatter(
+                    scratch_y,
+                    scratch_pred,
+                    scratch_metrics,
+                    args.out_dir / "scatter_best_scratch_new_target.png",
+                    f"Trained from scratch on new target, k={k}",
+                )
+                save_predictions_csv(
+                    scratch_y,
+                    scratch_pred,
+                    args.out_dir / "predictions_best_scratch_new_target.csv",
+                )
+
+            write_csv(result_rows, args.out_dir / "transfer_results_raw.csv")
+            summary_rows = aggregate_rows(result_rows)
+            write_csv(summary_rows, args.out_dir / "transfer_results_aggregated.csv")
+            save_learning_curve(
+                summary_rows,
+                zero_shot_mae=float(zero_metrics["mae"]),
+                source_reference_mae=maybe_load_source_reference_mae(args.source_checkpoint),
+                out_path=args.out_dir / "mae_vs_number_of_new_target_samples.png",
+            )
+
+    summary_rows = aggregate_rows(result_rows)
+    write_csv(result_rows, args.out_dir / "transfer_results_raw.csv")
+    write_csv(summary_rows, args.out_dir / "transfer_results_aggregated.csv")
+
+    with (args.out_dir / "zero_shot_metrics.json").open("w") as handle:
+        json.dump(zero_metrics, handle, indent=2)
+
+    config = {
+        "experiment": "target_transfer_depth_8_fixed_backend",
+        "source_checkpoint": str(args.source_checkpoint),
+        "new_target_pkl": str(args.new_target_pkl),
+        "backend_name": args.backend_name,
+        "global_feature_variant": args.global_feature_variant,
+        "target_mode": "delta_loss",
+        "delta_definition": "oracle_noiseless_fidelity - noisy_fidelity",
+        "k_values": args.k_values,
+        "n_repeats": args.n_repeats,
+        "batch_size": args.batch_size,
+        "finetune_epochs": args.finetune_epochs,
+        "scratch_epochs": args.scratch_epochs,
+        "finetune_lr": args.finetune_lr,
+        "scratch_lr": args.scratch_lr,
+        "patience": args.patience,
+        "min_delta": args.min_delta,
+        "seed": args.seed,
+        "max_groups": args.max_groups,
+        "freeze_gnn": args.freeze_gnn,
+        "split": {
+            "train_size": len(train_graphs),
+            "val_size": len(val_graphs),
+            "test_size": len(test_graphs),
+        },
+        "model_kwargs": source_model_kwargs,
+    }
+
+    with (args.out_dir / "experiment_config.json").open("w") as handle:
+        json.dump(config, handle, indent=2)
+
+    save_learning_curve(
+        summary_rows,
+        zero_shot_mae=float(zero_metrics["mae"]),
+        source_reference_mae=maybe_load_source_reference_mae(args.source_checkpoint),
+        out_path=args.out_dir / "mae_vs_number_of_new_target_samples.png",
+    )
+
+    print("\n" + "=" * 80)
+    print("DONE")
+    print("=" * 80)
+    print(f"Saved raw results to:        {args.out_dir / 'transfer_results_raw.csv'}")
+    print(f"Saved aggregated results to: {args.out_dir / 'transfer_results_aggregated.csv'}")
+    print(f"Saved MAE plot to:           {args.out_dir / 'mae_vs_number_of_new_target_samples.png'}")
+    print(f"Saved zero-shot scatter to:  {args.out_dir / 'scatter_zero_shot_new_target.png'}")
+
+    print("\nAggregated fine-tuning / scratch summary:")
+    for row in summary_rows:
+        print(
+            f"{row['approach']:20s} | "
+            f"k={int(row['k']):6d} | "
+            f"MAE={float(row['mae_mean']):.6f} +/- {float(row['mae_std']):.6f} | "
+            f"RMSE={float(row['rmse_mean']):.6f} +/- {float(row['rmse_std']):.6f} | "
+            f"R2={float(row['r2_mean']):.4f}"
+        )
+
+
+if __name__ == "__main__":
+    main()
